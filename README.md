@@ -5,6 +5,12 @@ A CLI tool that translates natural language into shell commands using Claude AI.
 ## Installation
 
 ```bash
+cargo install --git https://github.com/isaac/llm-exec
+```
+
+Or build from source:
+
+```bash
 cargo build --release
 ```
 
@@ -35,10 +41,35 @@ llm-exec show disk usage sorted by size
 ### Options
 
 - `-n, --history-lines <N>` - Number of shell history lines to include for context (default: 100)
+- `-y, --yes` - Skip confirmation and execute immediately
+- `--dry-run` - Show what would be sent to the API without making a request
 
 ```bash
 llm-exec -n 50 "undo my last git commit"
+llm-exec -y "list files"  # Execute without confirmation
 ```
+
+## Configuration
+
+Create a config file at `~/.config/llm-exec/config.json`:
+
+```json
+{
+  "model": "claude-haiku-4-5-20251001",
+  "max_tokens": 1024,
+  "history_lines": 100,
+  "system_prompt_suffix": "Additional instructions appended to the default prompt",
+  "system_prompt": "Complete override of the system prompt"
+}
+```
+
+All fields are optional:
+
+- `model` - Claude model to use (default: `claude-haiku-4-5-20251001`)
+- `max_tokens` - Maximum tokens for response (default: 1024)
+- `history_lines` - Number of shell history lines to include (default: 100)
+- `system_prompt_suffix` - Additional instructions appended to the default system prompt
+- `system_prompt` - Complete replacement for the default system prompt
 
 ## How it works
 
@@ -50,3 +81,7 @@ llm-exec -n 50 "undo my last git commit"
 ## License
 
 MIT
+
+---
+
+*This tool (and most of this README) was written with Claude. There may be bugs—PRs welcome!*
