@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(cargo build:*)",
+      "Bash(./target/release/llm-exec:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
