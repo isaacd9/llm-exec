@@ -3,7 +3,9 @@
     "allow": [
       "Bash(mkdir:*)",
       "Bash(cargo build:*)",
-      "Bash(./target/release/llm-exec:*)"
+      "Bash(./target/release/llm-exec:*)",
+      "Bash(find:*)",
+      "Bash(echo:*)"
     ],
     "deny": [],
     "ask": []

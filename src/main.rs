@@ -11,13 +11,15 @@ const CONFIG_PATH: &str = ".config/llm-exec/config.json";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a command-line assistant. Based on the user's request and their shell history, suggest a single shell command to accomplish their goal.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a command-line assistant that outputs ONLY shell commands.
 
-IMPORTANT: Respond with ONLY the command itself, nothing else. No explanation, no markdown, no code blocks - just the raw command.
+RULES:
+1. Output ONLY a single shell command - nothing else
+2. NO explanations, NO markdown, NO code blocks, NO backticks, NO formatting
+3. If you cannot help, output: echo "Error: <reason>"
+4. Never suggest running "{}" - the user is already running that to talk to you
 
-IMPORTANT: Never suggest running "{}". The user is already running that command to talk to you - suggesting it would be circular and unhelpful.
-
-Working directory context: The user is likely working in whatever directory their history suggests."#;
+Your entire response must be a valid shell command that can be executed directly."#;
 
 #[derive(Deserialize, Default)]
 struct Config {
@@ -317,14 +319,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suggested_command = call_claude(&prompt, &history, &config, &argv0).await?;
     eprintln!("\r           \r"); // Clear "Thinking..."
 
-    // Clean up the command (remove any accidental markdown or whitespace)
-    let suggested_command = suggested_command
-        .trim()
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim_start_matches("bash")
-        .trim_start_matches("sh")
-        .trim();
+    let suggested_command = suggested_command.trim();
+
+    // Check if the response is an error sigil from the LLM
+    if let Some(error_msg) = suggested_command
+        .strip_prefix("echo \"Error: ")
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        eprintln!("\x1b[1;31mError:\x1b[0m {}", error_msg);
+        std::process::exit(1);
+    }
 
     // Present the command
     println!("\x1b[1;36mSuggested command:\x1b[0m");
@@ -336,13 +340,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if should_execute {
         // Add to shell history before execution so it's available even if command fails
-        if let Err(e) = append_to_history(suggested_command) {
+        if let Err(e) = append_to_history(&suggested_command) {
             eprintln!("Warning: Could not add to history: {}", e);
         }
         if !args.yes {
             println!();
         }
-        execute_command(suggested_command)?;
+        execute_command(&suggested_command)?;
     } else {
         println!("Cancelled.");
     }
