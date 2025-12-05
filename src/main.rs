@@ -6,7 +6,8 @@ use std::process::{Command, Stdio};
 
 const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
-const DEFAULT_HISTORY_LINES: usize = 100;
+const DEFAULT_HISTORY_LINES: usize = 1000;
+const DEFAULT_CONTEXT_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 const CONFIG_PATH: &str = ".config/llm-exec/config.json";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -33,6 +34,8 @@ struct Config {
     system_prompt_suffix: Option<String>,
     /// Complete override of the system prompt (replaces default)
     system_prompt: Option<String>,
+    /// Context files to look for in cwd and parent directories (default: ["CLAUDE.md", "AGENTS.md"])
+    context_files: Option<Vec<String>>,
 }
 
 fn get_config_path() -> Option<PathBuf> {
@@ -105,6 +108,47 @@ struct AnthropicResponse {
     content: Vec<ContentBlock>,
 }
 
+/// Load context files from current directory and parent directories.
+/// Files closer to the current directory take precedence (loaded last).
+fn load_context_files(filenames: &[String]) -> String {
+    if filenames.is_empty() {
+        return String::new();
+    }
+
+    let mut context_parts: Vec<String> = Vec::new();
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
+    };
+
+    // Collect all parent directories from root to cwd
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut current = Some(cwd.as_path());
+    while let Some(dir) = current {
+        dirs.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+
+    // Process from root to cwd (so closer files are appended last)
+    dirs.reverse();
+
+    for dir in dirs {
+        for filename in filenames {
+            let path = dir.join(filename);
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let content = content.trim();
+                    if !content.is_empty() {
+                        context_parts.push(format!("# {}\n\n{}", path.display(), content));
+                    }
+                }
+            }
+        }
+    }
+
+    context_parts.join("\n\n")
+}
+
 fn get_history_file() -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     let history_files = [
@@ -164,7 +208,7 @@ fn append_to_history(command: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn call_claude(prompt: &str, history: &str, config: &Config, argv0: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn call_claude(prompt: &str, history: &str, context_files: &str, config: &Config, argv0: &str) -> Result<String, Box<dyn std::error::Error>> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
 
@@ -174,11 +218,20 @@ async fn call_claude(prompt: &str, history: &str, config: &Config, argv0: &str) 
         .unwrap_or(DEFAULT_SYSTEM_PROMPT)
         .replace("{}", argv0);
 
-    let system_prompt = if let Some(suffix) = &config.system_prompt_suffix {
-        format!("{}\n\nThe user's recent shell history:\n{}\n\n{}", base_prompt, history, suffix)
-    } else {
-        format!("{}\n\nThe user's recent shell history:\n{}", base_prompt, history)
-    };
+    let mut system_prompt = base_prompt;
+
+    if !context_files.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(context_files);
+    }
+
+    system_prompt.push_str("\n\nThe user's recent shell history:\n");
+    system_prompt.push_str(history);
+
+    if let Some(suffix) = &config.system_prompt_suffix {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(suffix);
+    }
 
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let max_tokens = config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
@@ -285,6 +338,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Load context files from cwd and parent directories
+    let context_filenames: Vec<String> = config
+        .context_files
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONTEXT_FILES.iter().map(|s| s.to_string()).collect());
+    let context_files = load_context_files(&context_filenames);
+
     // Get argv[0] (the command name used to invoke this program)
     let argv0 = std::env::args()
         .next()
@@ -299,11 +359,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.dry_run {
         let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
         let base_prompt = config.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT).replace("{}", &argv0);
-        let system_prompt = if let Some(suffix) = &config.system_prompt_suffix {
-            format!("{}\n\nThe user's recent shell history:\n{}\n\n{}", base_prompt, history, suffix)
-        } else {
-            format!("{}\n\nThe user's recent shell history:\n{}", base_prompt, history)
-        };
+
+        let mut system_prompt = base_prompt;
+
+        if !context_files.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&context_files);
+        }
+
+        system_prompt.push_str("\n\nThe user's recent shell history:\n");
+        system_prompt.push_str(&history);
+
+        if let Some(suffix) = &config.system_prompt_suffix {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(suffix);
+        }
 
         println!("\x1b[1;36mModel:\x1b[0m {}", model);
         println!();
@@ -316,7 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Call Claude
     eprint!("Thinking...");
-    let suggested_command = call_claude(&prompt, &history, &config, &argv0).await?;
+    let suggested_command = call_claude(&prompt, &history, &context_files, &config, &argv0).await?;
     eprintln!("\r           \r"); // Clear "Thinking..."
 
     let suggested_command = suggested_command.trim();
