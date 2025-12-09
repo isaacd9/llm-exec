@@ -208,10 +208,7 @@ fn append_to_history(command: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn call_claude(prompt: &str, history: &str, context_files: &str, config: &Config, argv0: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
-
+fn build_system_prompt(history: &str, context_files: &str, config: &Config, argv0: &str) -> String {
     let base_prompt = config
         .system_prompt
         .as_deref()
@@ -233,17 +230,36 @@ async fn call_claude(prompt: &str, history: &str, context_files: &str, config: &
         system_prompt.push_str(suffix);
     }
 
+    system_prompt
+}
+
+async fn call_claude(prompt: &str, history: &str, context_files: &str, config: &Config, argv0: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let messages = vec![("user".to_string(), prompt.to_string())];
+    call_claude_with_messages(&messages, history, context_files, config, argv0).await
+}
+
+async fn call_claude_with_messages(messages: &[(String, String)], history: &str, context_files: &str, config: &Config, argv0: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
+
+    let system_prompt = build_system_prompt(history, context_files, config, argv0);
+
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let max_tokens = config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+
+    let api_messages: Vec<Message> = messages
+        .iter()
+        .map(|(role, content)| Message {
+            role: role.clone(),
+            content: content.clone(),
+        })
+        .collect();
 
     let request = AnthropicRequest {
         model: model.to_string(),
         max_tokens,
         system: system_prompt,
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }],
+        messages: api_messages,
     };
 
     let client = reqwest::Client::new();
@@ -271,14 +287,30 @@ async fn call_claude(prompt: &str, history: &str, context_files: &str, config: &
         .ok_or_else(|| "No response from Claude".into())
 }
 
-fn prompt_yes_no(prompt: &str) -> bool {
-    print!("{} [y/N]: ", prompt);
+enum PromptResponse {
+    Yes,
+    No,
+    Edit(String),
+}
+
+fn prompt_yes_no_edit(prompt: &str) -> PromptResponse {
+    print!("{} [y/N/e]: ", prompt);
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
 
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => PromptResponse::Yes,
+        "e" | "edit" => {
+            print!("Edit instructions: ");
+            io::stdout().flush().unwrap();
+            let mut edit_input = String::new();
+            io::stdin().read_line(&mut edit_input).unwrap();
+            PromptResponse::Edit(edit_input.trim().to_string())
+        }
+        _ => PromptResponse::No,
+    }
 }
 
 fn execute_command(command: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -386,39 +418,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Call Claude
     eprint!("Thinking...");
-    let suggested_command = call_claude(&prompt, &history, &context_files, &config, &argv0).await?;
+    let mut suggested_command = call_claude(&prompt, &history, &context_files, &config, &argv0).await?;
     eprintln!("\r           \r"); // Clear "Thinking..."
 
-    let suggested_command = suggested_command.trim();
+    // Track conversation for edits
+    let mut messages: Vec<(String, String)> = vec![
+        ("user".to_string(), prompt.clone()),
+        ("assistant".to_string(), suggested_command.clone()),
+    ];
 
-    // Check if the response is an error sigil from the LLM
-    if let Some(error_msg) = suggested_command
-        .strip_prefix("echo \"Error: ")
-        .and_then(|s| s.strip_suffix('"'))
-    {
-        eprintln!("\x1b[1;31mError:\x1b[0m {}", error_msg);
-        std::process::exit(1);
-    }
+    loop {
+        let suggested_command_trimmed = suggested_command.trim();
 
-    // Present the command
-    println!("\x1b[1;36mSuggested command:\x1b[0m");
-    println!("\x1b[1;33m  {}\x1b[0m", suggested_command);
-    println!();
-
-    // Execute (with or without confirmation)
-    let should_execute = args.yes || prompt_yes_no("Execute this command?");
-
-    if should_execute {
-        // Add to shell history before execution so it's available even if command fails
-        if let Err(e) = append_to_history(&suggested_command) {
-            eprintln!("Warning: Could not add to history: {}", e);
+        // Check if the response is an error sigil from the LLM
+        if let Some(error_msg) = suggested_command_trimmed
+            .strip_prefix("echo \"Error: ")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            eprintln!("\x1b[1;31mError:\x1b[0m {}", error_msg);
+            std::process::exit(1);
         }
-        if !args.yes {
-            println!();
+
+        // Present the command
+        println!("\x1b[1;36mSuggested command:\x1b[0m");
+        println!("\x1b[1;33m  {}\x1b[0m", suggested_command_trimmed);
+        println!();
+
+        // Execute (with or without confirmation)
+        if args.yes {
+            // Add to shell history before execution so it's available even if command fails
+            if let Err(e) = append_to_history(suggested_command_trimmed) {
+                eprintln!("Warning: Could not add to history: {}", e);
+            }
+            execute_command(suggested_command_trimmed)?;
+            break;
         }
-        execute_command(&suggested_command)?;
-    } else {
-        println!("Cancelled.");
+
+        match prompt_yes_no_edit("Execute this command?") {
+            PromptResponse::Yes => {
+                // Add to shell history before execution so it's available even if command fails
+                if let Err(e) = append_to_history(suggested_command_trimmed) {
+                    eprintln!("Warning: Could not add to history: {}", e);
+                }
+                println!();
+                execute_command(suggested_command_trimmed)?;
+                break;
+            }
+            PromptResponse::No => {
+                println!("Cancelled.");
+                break;
+            }
+            PromptResponse::Edit(edit_instructions) => {
+                if edit_instructions.is_empty() {
+                    println!("No edit instructions provided.");
+                    continue;
+                }
+
+                // Add edit instructions to conversation
+                messages.push(("user".to_string(), edit_instructions));
+
+                // Call Claude with full conversation
+                eprint!("Thinking...");
+                suggested_command = call_claude_with_messages(&messages, &history, &context_files, &config, &argv0).await?;
+                eprintln!("\r           \r"); // Clear "Thinking..."
+
+                // Add response to conversation
+                messages.push(("assistant".to_string(), suggested_command.clone()));
+            }
+        }
     }
 
     Ok(())
